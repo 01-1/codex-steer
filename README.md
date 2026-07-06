@@ -118,9 +118,11 @@ npm publish
 ## Notes
 
 - Requires `codex` on `PATH`.
-- Uses `codex app-server daemon start`, so run it with your normal Codex home/install.
+- Uses `codex app-server daemon start` and enables app-server remote control before proxying, so run it with your normal Codex home/install.
+- If the daemon proxy does not answer initialization for a new run or review, the wrapper restarts the daemon once and retries. Steering an existing run does not auto-restart the daemon.
 - Requires Node.js 18 or newer.
 - `cxrun <id> <prompt...>` streams assistant message deltas and selected command/file output deltas to stdout.
 - `cxrun steer <id> <message...>` exits after the steering message has been accepted by app-server.
 - `cxreview <id>` streams review output from Codex's `review/start` app-server method.
 - State and run history pointers are stored in `${XDG_STATE_HOME:-~/.local/state}/codex-steer`. Set `CODEX_STEER_STATE_DIR` to override it.
+- Set `CODEX_STEER_ENABLE_REMOTE_CONTROL=0` to skip automatic `codex app-server daemon enable-remote-control`.

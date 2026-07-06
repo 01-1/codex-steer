@@ -5,11 +5,12 @@ const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
 
-const VERSION = "0.1.0";
+const VERSION = require("../package.json").version;
 const APP_NAME = "codex-steer";
 const COMMAND_NAME = path.basename(process.argv[1] || "cxrun");
 const IS_REVIEW = COMMAND_NAME === "cxreview";
 const RPC_TIMEOUT_MS = Number(process.env.CODEX_STEER_RPC_TIMEOUT_MS || 30000);
+const ENABLE_REMOTE_CONTROL = process.env.CODEX_STEER_ENABLE_REMOTE_CONTROL !== "0";
 let STATE_DIR = process.env.CODEX_STEER_STATE_DIR ||
   path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), APP_NAME);
 
@@ -171,15 +172,33 @@ function codex(args, options = {}) {
   if (result.status !== 0) process.exit(result.status || 1);
 }
 
+function ensureAppServerDaemon() {
+  codex(["app-server", "daemon", "start"]);
+  if (ENABLE_REMOTE_CONTROL) {
+    codex(["app-server", "daemon", "enable-remote-control"]);
+  }
+}
+
+function restartAppServerDaemon() {
+  codex(["app-server", "daemon", "restart"]);
+  if (ENABLE_REMOTE_CONTROL) {
+    codex(["app-server", "daemon", "enable-remote-control"]);
+  }
+}
+
 class JsonRpcClient {
   constructor() {
+    this.nextId = 1;
+    this.pending = new Map();
+    this.handlers = new Map();
+    this.spawnProxy();
+  }
+
+  spawnProxy() {
     this.proc = spawn("codex", ["app-server", "proxy"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });
-    this.nextId = 1;
-    this.pending = new Map();
-    this.handlers = new Map();
     this.buffer = "";
 
     this.proc.stdout.setEncoding("utf8");
@@ -245,7 +264,17 @@ class JsonRpcClient {
   }
 
   close() {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+    }
+    this.pending.clear();
     this.proc.stdin.end();
+    this.proc.kill();
+  }
+
+  restartProxy() {
+    this.close();
+    this.spawnProxy();
   }
 }
 
@@ -304,6 +333,22 @@ async function initialize(client) {
     capabilities: { experimentalApi: true },
   });
   client.notify("initialized");
+}
+
+async function initializeWithDaemonRetry(client, allowRestart) {
+  try {
+    await initialize(client);
+  } catch (err) {
+    const message = err && err.message ? err.message : String(err);
+    if (!allowRestart || !message.includes("timed out waiting for initialize")) {
+      throw err;
+    }
+
+    process.stderr.write(`${APP_NAME}: app-server proxy did not answer initialize; restarting daemon and retrying once\n`);
+    restartAppServerDaemon();
+    client.restartProxy();
+    await initialize(client);
+  }
 }
 
 async function startRun(id, prompt) {
@@ -417,7 +462,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
   });
 
   try {
-    await initialize(client);
+    await initializeWithDaemonRetry(client, true);
     const thread = await client.request("thread/start", {
       cwd: process.cwd(),
       threadSource: { type: "codex_app_server" },
@@ -457,7 +502,7 @@ async function steerRun(id, message) {
   }
 
   const client = new JsonRpcClient();
-  await initialize(client);
+  await initializeWithDaemonRetry(client, false);
   await client.request("turn/steer", {
     threadId: state.threadId,
     expectedTurnId: state.turnId,
@@ -519,7 +564,7 @@ async function main() {
   }
 
   if (args[0] === "daemon-start") {
-    codex(["app-server", "daemon", "start"]);
+    ensureAppServerDaemon();
     return;
   }
   if (args[0] === "status") {
@@ -531,11 +576,12 @@ async function main() {
     return;
   }
   if (args[0] === "steer" || args[0] === "send") {
+    ensureAppServerDaemon();
     await steerRun(safeId(args[1]), getPrompt(args, 2));
     return;
   }
 
-  codex(["app-server", "daemon", "start"]);
+  ensureAppServerDaemon();
   if (IS_REVIEW) {
     const offset = args[0] === "review" ? 2 : 1;
     const id = safeId(args[offset - 1]);

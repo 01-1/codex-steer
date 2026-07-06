@@ -7,11 +7,35 @@ const { spawn, spawnSync } = require("child_process");
 
 const VERSION = "0.1.0";
 const APP_NAME = "codex-steer";
+const COMMAND_NAME = path.basename(process.argv[1] || "cxrun");
+const IS_REVIEW = COMMAND_NAME === "cxreview";
 let STATE_DIR = process.env.CODEX_STEER_STATE_DIR ||
   path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), APP_NAME);
 
 function usage(exitCode = 0) {
   const out = exitCode === 0 ? process.stdout : process.stderr;
+  if (IS_REVIEW) {
+    out.write(`Usage:
+  cxreview <id> [context...]
+  cxreview review <id> [--against <branch>] [context...]
+  cxreview steer <id> <message...>
+  cxreview send <id> <message...>
+  cxreview status [id]
+  cxreview stop <id>
+
+Examples:
+  cxreview my-review
+  cxreview review my-review --against main
+  cxreview steer my-review "ignore generated files"
+
+The first form starts a Codex app-server review and streams live output to stdout.
+The steer/send forms append user input to the active review turn for that id.
+If app-server reports that the active review turn is not steerable, cxreview prints
+the exact JSON-RPC error.
+`);
+    process.exit(exitCode);
+  }
+
   out.write(`Usage:
   cxrun <id> <prompt...>
   cxrun <id> -- <prompt...>
@@ -213,7 +237,7 @@ class JsonRpcClient {
 
 function formatRpcError(error) {
   if (typeof error === "string") return error;
-  if (error && error.message) return error.message;
+  if (error && typeof error === "object") return JSON.stringify(error);
   return JSON.stringify(error);
 }
 
@@ -225,6 +249,41 @@ function outputDelta(params) {
   return params.delta || params.content || params.text || params.chunk || "";
 }
 
+function parseReviewArgs(args, offset) {
+  const parts = args.slice(offset);
+  const target = { type: "uncommittedChanges" };
+  const context = [];
+
+  for (let i = 0; i < parts.length; i += 1) {
+    const arg = parts[i];
+    if (arg === "--") {
+      context.push(...parts.slice(i + 1));
+      break;
+    }
+    if (arg === "--against") {
+      const branch = parts[i + 1];
+      if (!branch || branch.startsWith("-")) die("--against requires a branch");
+      target.type = "baseBranch";
+      target.branch = branch;
+      i += 1;
+      continue;
+    }
+    if (arg.startsWith("--against=")) {
+      const branch = arg.slice("--against=".length);
+      if (!branch) die("--against requires a branch");
+      target.type = "baseBranch";
+      target.branch = branch;
+      continue;
+    }
+    context.push(arg);
+  }
+
+  if (context.length === 1 && context[0] === "-") {
+    return { target, context: fs.readFileSync(0, "utf8") };
+  }
+  return { target, context: context.join(" ") };
+}
+
 async function initialize(client) {
   await client.request("initialize", {
     clientInfo: { name: APP_NAME, title: APP_NAME, version: VERSION },
@@ -234,6 +293,38 @@ async function initialize(client) {
 }
 
 async function startRun(id, prompt) {
+  await startTurn(id, "run", async (client, threadId) => {
+    const turn = await client.request("turn/start", {
+      threadId,
+      input: userInput(prompt),
+    });
+    return { threadId, turnId: turn.turn.id };
+  });
+}
+
+async function startReview(id, target, context) {
+  await startTurn(id, "review", async (client, threadId) => {
+    const review = await client.request("review/start", {
+      threadId,
+      target,
+      delivery: "inline",
+    });
+    return { threadId: review.reviewThreadId, turnId: review.turn.id };
+  }, async (client, started) => {
+    if (!context) return;
+    try {
+      await client.request("turn/steer", {
+        threadId: started.threadId,
+        expectedTurnId: started.turnId,
+        input: userInput(context),
+      });
+    } catch (err) {
+      process.stderr.write(`${APP_NAME}: ${err.message || String(err)}\n`);
+    }
+  });
+}
+
+async function startTurn(id, kind, starter, afterStart = null) {
   const lockFd = acquireRunLock(id);
   const client = new JsonRpcClient();
   let threadId = null;
@@ -278,30 +369,35 @@ async function startRun(id, prompt) {
     }
   });
 
-  await initialize(client);
-  const thread = await client.request("thread/start", {
-    cwd: process.cwd(),
-    threadSource: { type: "codex_app_server" },
-  });
-  threadId = thread.thread.id;
+  try {
+    await initialize(client);
+    const thread = await client.request("thread/start", {
+      cwd: process.cwd(),
+      threadSource: { type: "codex_app_server" },
+    });
+    threadId = thread.thread.id;
 
-  const turn = await client.request("turn/start", {
-    threadId,
-    input: userInput(prompt),
-  });
-  turnId = turn.turn.id;
+    const started = await starter(client, threadId);
+    threadId = started.threadId;
+    turnId = started.turnId;
 
-  writeState(id, {
-    id,
-    status: "running",
-    ownerPid: process.pid,
-    threadId,
-    turnId,
-    cwd: process.cwd(),
-    startedAt: new Date().toISOString(),
-  });
+    writeState(id, {
+      id,
+      kind,
+      status: "running",
+      ownerPid: process.pid,
+      threadId,
+      turnId,
+      cwd: process.cwd(),
+      startedAt: new Date().toISOString(),
+    });
+    if (afterStart) await afterStart(client, started);
 
-  await new Promise((resolve) => client.proc.on("exit", resolve));
+    await new Promise((resolve) => client.proc.on("exit", resolve));
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
   if (!completed) {
     cleanup();
     process.exit(exitCode || 1);
@@ -381,6 +477,14 @@ async function main() {
   }
 
   codex(["app-server", "daemon", "start"]);
+  if (IS_REVIEW) {
+    const offset = args[0] === "review" ? 2 : 1;
+    const id = safeId(args[offset - 1]);
+    const review = parseReviewArgs(args, offset);
+    await startReview(id, review.target, review.context);
+    return;
+  }
+
   await startRun(safeId(args[0]), getPrompt(args, 1));
 }
 

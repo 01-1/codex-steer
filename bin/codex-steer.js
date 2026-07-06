@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 const fs = require("fs");
+const net = require("net");
 const os = require("os");
 const path = require("path");
 const { spawn, spawnSync } = require("child_process");
@@ -89,6 +90,10 @@ function lockPath(id) {
   return path.join(STATE_DIR, `${safeId(id)}.lock`);
 }
 
+function controlPath(id) {
+  return path.join(STATE_DIR, `${safeId(id)}.sock`);
+}
+
 function pidIsAlive(pid) {
   if (!pid || typeof pid !== "number") return false;
   try {
@@ -129,6 +134,12 @@ function removeLock(id) {
   } catch {}
 }
 
+function removeControlSocket(id) {
+  try {
+    fs.unlinkSync(controlPath(id));
+  } catch {}
+}
+
 function acquireRunLock(id) {
   ensureStateDir();
   const existing = readState(id);
@@ -140,6 +151,7 @@ function acquireRunLock(id) {
   try {
     const fd = fs.openSync(lockPath(id), "wx", 0o600);
     fs.writeFileSync(fd, String(process.pid));
+    removeControlSocket(id);
     return fd;
   } catch {
     die(`id "${id}" is already running`);
@@ -179,23 +191,16 @@ function ensureAppServerDaemon() {
   }
 }
 
-function restartAppServerDaemon() {
-  codex(["app-server", "daemon", "restart"]);
-  if (ENABLE_REMOTE_CONTROL) {
-    codex(["app-server", "daemon", "enable-remote-control"]);
-  }
-}
-
 class JsonRpcClient {
   constructor() {
     this.nextId = 1;
     this.pending = new Map();
     this.handlers = new Map();
-    this.spawnProxy();
+    this.spawnServer();
   }
 
-  spawnProxy() {
-    this.proc = spawn("codex", ["app-server", "proxy"], {
+  spawnServer() {
+    this.proc = spawn("codex", ["app-server", "--stdio"], {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });
@@ -204,7 +209,7 @@ class JsonRpcClient {
     this.proc.stdout.setEncoding("utf8");
     this.proc.stdout.on("data", (chunk) => this.onData(chunk));
     this.proc.stderr.on("data", (chunk) => process.stderr.write(chunk));
-    this.proc.on("error", (err) => die(`failed to run codex app-server proxy: ${err.message}`));
+    this.proc.on("error", (err) => die(`failed to run codex app-server: ${err.message}`));
   }
 
   onData(chunk) {
@@ -272,10 +277,6 @@ class JsonRpcClient {
     this.proc.kill();
   }
 
-  restartProxy() {
-    this.close();
-    this.spawnProxy();
-  }
 }
 
 function formatRpcError(error) {
@@ -285,7 +286,7 @@ function formatRpcError(error) {
 }
 
 function userInput(text) {
-  return [{ type: "text", text }];
+  return [{ type: "text", text, text_elements: [] }];
 }
 
 function outputDelta(params) {
@@ -335,20 +336,67 @@ async function initialize(client) {
   client.notify("initialized");
 }
 
-async function initializeWithDaemonRetry(client, allowRestart) {
-  try {
-    await initialize(client);
-  } catch (err) {
-    const message = err && err.message ? err.message : String(err);
-    if (!allowRestart || !message.includes("timed out waiting for initialize")) {
-      throw err;
-    }
+function readJsonLine(socket, timeoutMs = RPC_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    let buffer = "";
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error(`timed out waiting for local control response after ${timeoutMs}ms`));
+    }, timeoutMs);
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("data", onData);
+      socket.off("error", onError);
+      socket.off("end", onEnd);
+    };
+    const onError = (err) => {
+      cleanup();
+      reject(err);
+    };
+    const onEnd = () => {
+      cleanup();
+      reject(new Error("local control socket closed"));
+    };
+    const onData = (chunk) => {
+      buffer += chunk;
+      const idx = buffer.indexOf("\n");
+      if (idx < 0) return;
+      cleanup();
+      try {
+        resolve(JSON.parse(buffer.slice(0, idx)));
+      } catch (err) {
+        reject(err);
+      }
+    };
+    socket.setEncoding("utf8");
+    socket.on("data", onData);
+    socket.on("error", onError);
+    socket.on("end", onEnd);
+  });
+}
 
-    process.stderr.write(`${APP_NAME}: app-server proxy did not answer initialize; restarting daemon and retrying once\n`);
-    restartAppServerDaemon();
-    client.restartProxy();
-    await initialize(client);
-  }
+function startControlServer(id, handleMessage) {
+  removeControlSocket(id);
+  const server = net.createServer((socket) => {
+    readJsonLine(socket).then(async (request) => {
+      try {
+        const result = await handleMessage(request);
+        socket.end(`${JSON.stringify({ ok: true, result })}\n`);
+      } catch (err) {
+        socket.end(`${JSON.stringify({ ok: false, error: err.message || String(err) })}\n`);
+      }
+    }).catch((err) => {
+      socket.end(`${JSON.stringify({ ok: false, error: err.message || String(err) })}\n`);
+    });
+  });
+
+  return new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(controlPath(id), () => {
+      server.off("error", reject);
+      resolve(server);
+    });
+  });
 }
 
 async function startRun(id, prompt) {
@@ -388,6 +436,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
   const client = new JsonRpcClient();
   let threadId = null;
   let turnId = null;
+  let controlServer = null;
   let completed = false;
   let exitCode = 0;
   let cleanedUp = false;
@@ -398,6 +447,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
     ownerPid: process.pid,
     threadId: null,
     turnId: null,
+    controlSocket: controlPath(id),
     cwd: process.cwd(),
     startedAt: new Date().toISOString(),
   };
@@ -420,6 +470,11 @@ async function startTurn(id, kind, starter, afterStart = null) {
   const cleanup = () => {
     if (cleanedUp) return;
     cleanedUp = true;
+    if (controlServer) {
+      controlServer.close();
+      controlServer = null;
+    }
+    removeControlSocket(id);
     releaseRunLock(id, lockFd);
     client.close();
   };
@@ -430,7 +485,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
   });
   process.on("SIGTERM", () => {
     const current = readState(id);
-    const status = current && current.status === "stopping" ? "stopped" : "interrupted";
+    const status = current && (current.status === "stopping" || current.status === "stopped") ? "stopped" : "interrupted";
     updateRunState(status, { signal: "SIGTERM", exitCode: 143 });
     cleanup();
     process.exit(143);
@@ -462,16 +517,27 @@ async function startTurn(id, kind, starter, afterStart = null) {
   });
 
   try {
-    await initializeWithDaemonRetry(client, true);
+    await initialize(client);
     const thread = await client.request("thread/start", {
       cwd: process.cwd(),
-      threadSource: { type: "codex_app_server" },
+      threadSource: "codex_app_server",
     });
     threadId = thread.thread.id;
 
     const started = await starter(client, threadId);
     threadId = started.threadId;
     turnId = started.turnId;
+    controlServer = await startControlServer(id, async (request) => {
+      if (!request || (request.method !== "turn/steer" && request.method !== "turn/send")) {
+        throw new Error("unsupported local control request");
+      }
+      await client.request("turn/steer", {
+        threadId,
+        expectedTurnId: turnId,
+        input: userInput(request.message || ""),
+      });
+      return {};
+    });
     updateRunState("running");
     if (afterStart) await afterStart(client, started);
 
@@ -501,14 +567,30 @@ async function steerRun(id, message) {
     die(`stale id "${id}" was marked stale; no running thread remains`);
   }
 
-  const client = new JsonRpcClient();
-  await initializeWithDaemonRetry(client, false);
-  await client.request("turn/steer", {
-    threadId: state.threadId,
-    expectedTurnId: state.turnId,
-    input: userInput(message),
+  const socketPath = state.controlSocket || controlPath(id);
+  await new Promise((resolve, reject) => {
+    const socket = net.createConnection(socketPath);
+    const timer = setTimeout(() => {
+      socket.destroy();
+      reject(new Error(`timed out connecting to local control socket after ${RPC_TIMEOUT_MS}ms`));
+    }, RPC_TIMEOUT_MS);
+    socket.once("connect", async () => {
+      clearTimeout(timer);
+      socket.write(`${JSON.stringify({ method: "turn/steer", message })}\n`);
+      try {
+        const response = await readJsonLine(socket);
+        socket.end();
+        if (!response.ok) reject(new Error(response.error || "local control request failed"));
+        else resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+    socket.once("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
   });
-  client.close();
 }
 
 function status(id) {
@@ -576,12 +658,10 @@ async function main() {
     return;
   }
   if (args[0] === "steer" || args[0] === "send") {
-    ensureAppServerDaemon();
     await steerRun(safeId(args[1]), getPrompt(args, 2));
     return;
   }
 
-  ensureAppServerDaemon();
   if (IS_REVIEW) {
     const offset = args[0] === "review" ? 2 : 1;
     const id = safeId(args[offset - 1]);

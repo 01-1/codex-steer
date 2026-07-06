@@ -97,6 +97,10 @@ function pidIsAlive(pid) {
   }
 }
 
+function stateIsActive(state) {
+  return state && (state.status === "starting" || state.status === "running" || state.status === "stopping");
+}
+
 function readState(id) {
   try {
     return JSON.parse(fs.readFileSync(statePath(id), "utf8"));
@@ -114,6 +118,10 @@ function removeState(id) {
   try {
     fs.unlinkSync(statePath(id));
   } catch {}
+  removeLock(id);
+}
+
+function removeLock(id) {
   try {
     fs.unlinkSync(lockPath(id));
   } catch {}
@@ -122,7 +130,7 @@ function removeState(id) {
 function acquireRunLock(id) {
   ensureStateDir();
   const existing = readState(id);
-  if (existing && existing.status === "running" && pidIsAlive(existing.ownerPid)) {
+  if (stateIsActive(existing) && pidIsAlive(existing.ownerPid)) {
     die(`id "${id}" is already running as pid ${existing.ownerPid}`);
   }
   removeState(id);
@@ -140,7 +148,7 @@ function releaseRunLock(id, fd) {
   try {
     fs.closeSync(fd);
   } catch {}
-  removeState(id);
+  removeLock(id);
 }
 
 function getPrompt(args, offset) {
@@ -331,16 +339,48 @@ async function startTurn(id, kind, starter, afterStart = null) {
   let turnId = null;
   let completed = false;
   let exitCode = 0;
+  let cleanedUp = false;
+  let state = {
+    id,
+    kind,
+    status: "starting",
+    ownerPid: process.pid,
+    threadId: null,
+    turnId: null,
+    cwd: process.cwd(),
+    startedAt: new Date().toISOString(),
+  };
+
+  writeState(id, state);
+
+  const updateRunState = (status, extra = {}) => {
+    state = {
+      ...state,
+      status,
+      ownerPid: status === "running" || status === "starting" ? process.pid : null,
+      threadId,
+      turnId,
+      endedAt: status === "running" || status === "starting" ? undefined : new Date().toISOString(),
+      ...extra,
+    };
+    writeState(id, state);
+  };
 
   const cleanup = () => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     releaseRunLock(id, lockFd);
     client.close();
   };
   process.on("SIGINT", () => {
+    updateRunState("interrupted", { signal: "SIGINT", exitCode: 130 });
     cleanup();
     process.exit(130);
   });
   process.on("SIGTERM", () => {
+    const current = readState(id);
+    const status = current && current.status === "stopping" ? "stopped" : "interrupted";
+    updateRunState(status, { signal: "SIGTERM", exitCode: 143 });
     cleanup();
     process.exit(143);
   });
@@ -364,6 +404,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
     if (p.threadId === threadId && (!turnId || !p.turn || p.turn.id === turnId)) {
       completed = true;
       if (!process.stdout.isTTY) process.stdout.write("\n");
+      updateRunState("completed", { exitCode });
       cleanup();
       process.exit(exitCode);
     }
@@ -380,25 +421,17 @@ async function startTurn(id, kind, starter, afterStart = null) {
     const started = await starter(client, threadId);
     threadId = started.threadId;
     turnId = started.turnId;
-
-    writeState(id, {
-      id,
-      kind,
-      status: "running",
-      ownerPid: process.pid,
-      threadId,
-      turnId,
-      cwd: process.cwd(),
-      startedAt: new Date().toISOString(),
-    });
+    updateRunState("running");
     if (afterStart) await afterStart(client, started);
 
     await new Promise((resolve) => client.proc.on("exit", resolve));
   } catch (err) {
+    updateRunState("failed", { error: err.message || String(err), exitCode: 1 });
     cleanup();
     throw err;
   }
   if (!completed) {
+    updateRunState("exited", { exitCode: exitCode || 1 });
     cleanup();
     process.exit(exitCode || 1);
   }
@@ -408,8 +441,13 @@ async function steerRun(id, message) {
   const state = readState(id);
   if (!state || state.status !== "running") die(`no running thread for id "${id}"`);
   if (!pidIsAlive(state.ownerPid)) {
-    removeState(id);
-    die(`stale id "${id}" was cleaned up; no running thread remains`);
+    writeState(id, {
+      ...state,
+      status: "stale",
+      ownerPid: null,
+      endedAt: new Date().toISOString(),
+    });
+    die(`stale id "${id}" was marked stale; no running thread remains`);
   }
 
   const client = new JsonRpcClient();
@@ -432,12 +470,15 @@ function status(id) {
   for (const one of ids) {
     const state = readState(one);
     if (!state) continue;
-    if (state.status === "running" && !pidIsAlive(state.ownerPid)) {
-      removeState(one);
-      continue;
+    if (stateIsActive(state) && !pidIsAlive(state.ownerPid)) {
+      state.status = "stale";
+      state.ownerPid = null;
+      state.endedAt = new Date().toISOString();
+      writeState(one, state);
     }
     shown = true;
-    process.stdout.write(`${one}\t${state.status}\tpid=${state.ownerPid}\tthread=${state.threadId}\tturn=${state.turnId}\n`);
+    const pid = state.ownerPid ? `pid=${state.ownerPid}` : "pid=-";
+    process.stdout.write(`${one}\t${state.status}\t${pid}\tthread=${state.threadId || "-"}\tturn=${state.turnId || "-"}\n`);
   }
   if (!shown && id) die(`no state for id "${id}"`, 2);
 }
@@ -445,10 +486,22 @@ function status(id) {
 function stop(id) {
   const state = readState(id);
   if (!state) die(`no state for id "${id}"`);
+  const stopped = {
+    ...state,
+    status: "stopped",
+    ownerPid: null,
+    endedAt: new Date().toISOString(),
+  };
   if (pidIsAlive(state.ownerPid)) {
+    writeState(id, {
+      ...state,
+      status: "stopping",
+      endedAt: new Date().toISOString(),
+    });
     process.kill(state.ownerPid, "SIGTERM");
   }
-  removeState(id);
+  writeState(id, stopped);
+  removeLock(id);
 }
 
 async function main() {

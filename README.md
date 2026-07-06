@@ -62,6 +62,7 @@ cxrun stop fix-tests
 ```
 
 Ids may be reused after a run exits. The wrapper prevents the same id from being used by two running turns at once.
+Completed, interrupted, stopped, failed, and stale runs leave a small state file with the last known `threadId` and `turnId`, so `cxrun status <id>` can still recover the Codex history pointer after the process is gone.
 
 ## Reviews
 
@@ -122,4 +123,4 @@ npm publish
 - `cxrun <id> <prompt...>` streams assistant message deltas and selected command/file output deltas to stdout.
 - `cxrun steer <id> <message...>` exits after the steering message has been accepted by app-server.
 - `cxreview <id>` streams review output from Codex's `review/start` app-server method.
-- State is stored in `${XDG_STATE_HOME:-~/.local/state}/codex-steer`. Set `CODEX_STEER_STATE_DIR` to override it.
+- State and run history pointers are stored in `${XDG_STATE_HOME:-~/.local/state}/codex-steer`. Set `CODEX_STEER_STATE_DIR` to override it.

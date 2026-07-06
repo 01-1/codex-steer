@@ -1,6 +1,6 @@
 {
   "name": "codex-steer",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Tiny Codex app-server wrapper for starting and steering runs or reviews.",
   "keywords": [
     "codex",

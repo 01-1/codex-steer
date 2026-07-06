@@ -9,6 +9,7 @@ const VERSION = "0.1.0";
 const APP_NAME = "codex-steer";
 const COMMAND_NAME = path.basename(process.argv[1] || "cxrun");
 const IS_REVIEW = COMMAND_NAME === "cxreview";
+const RPC_TIMEOUT_MS = Number(process.env.CODEX_STEER_RPC_TIMEOUT_MS || 30000);
 let STATE_DIR = process.env.CODEX_STEER_STATE_DIR ||
   path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), APP_NAME);
 
@@ -211,6 +212,7 @@ class JsonRpcClient {
       const pending = this.pending.get(msg.id);
       if (!pending) return;
       this.pending.delete(msg.id);
+      clearTimeout(pending.timer);
       if (msg.error) pending.reject(new Error(formatRpcError(msg.error)));
       else pending.resolve(msg.result);
       return;
@@ -226,7 +228,11 @@ class JsonRpcClient {
     const id = this.nextId++;
     this.proc.stdin.write(`${JSON.stringify({ id, method, params })}\n`);
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`timed out waiting for ${method} after ${RPC_TIMEOUT_MS}ms`));
+      }, RPC_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, timer });
     });
   }
 

@@ -293,6 +293,57 @@ function outputDelta(params) {
   return params.delta || params.content || params.text || params.chunk || "";
 }
 
+let stdoutEndsWithNewline = true;
+
+function writeStdout(text) {
+  if (!text) return;
+  process.stdout.write(text);
+  stdoutEndsWithNewline = text.endsWith("\n");
+}
+
+function ensureStdoutNewline() {
+  if (!stdoutEndsWithNewline) writeStdout("\n");
+}
+
+function writeStdoutLine(text = "") {
+  ensureStdoutNewline();
+  writeStdout(`${text}\n`);
+}
+
+function outputBase64Delta(params) {
+  if (!params.deltaBase64) return "";
+  try {
+    return Buffer.from(params.deltaBase64, "base64").toString("utf8");
+  } catch {
+    return "";
+  }
+}
+
+function toolLabel(item) {
+  if (!item || !item.type) return null;
+  if (item.type === "commandExecution") return `$ ${item.command}`;
+  if (item.type === "mcpToolCall") return `tool ${item.server}.${item.tool}`;
+  if (item.type === "dynamicToolCall") return `tool ${item.namespace ? `${item.namespace}.` : ""}${item.tool}`;
+  if (item.type === "collabAgentToolCall") return `tool ${item.tool}`;
+  if (item.type === "webSearch") return `web search ${item.query}`;
+  if (item.type === "fileChange") return "file change";
+  if (item.type === "sleep") return `sleep ${Math.round((item.durationMs || 0) / 1000)}s`;
+  if (item.type === "imageGeneration") return "image generation";
+  return null;
+}
+
+function toolStatus(item) {
+  if (!item || !item.type) return "";
+  if (item.type === "commandExecution" && item.exitCode !== null && item.exitCode !== undefined) {
+    return `exit ${item.exitCode}`;
+  }
+  if (item.status) return String(item.status);
+  if (item.type === "dynamicToolCall" && item.success !== null && item.success !== undefined) {
+    return item.success ? "success" : "failed";
+  }
+  return "done";
+}
+
 function parseReviewArgs(args, offset) {
   const parts = args.slice(offset);
   const target = { type: "uncommittedChanges" };
@@ -437,6 +488,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
   let threadId = null;
   let turnId = null;
   let controlServer = null;
+  const streamedOutputItemIds = new Set();
   let completed = false;
   let exitCode = 0;
   let cleanedUp = false;
@@ -492,13 +544,40 @@ async function startTurn(id, kind, starter, afterStart = null) {
   });
 
   client.on("item/agentMessage/delta", (p) => {
-    if (!threadId || p.threadId === threadId) process.stdout.write(p.delta || "");
+    if (!threadId || p.threadId === threadId) writeStdout(p.delta || "");
+  });
+  client.on("item/started", (p) => {
+    if (threadId && p.threadId !== threadId) return;
+    const label = toolLabel(p.item);
+    if (label) writeStdoutLine(`> ${label}`);
+  });
+  client.on("item/completed", (p) => {
+    if (threadId && p.threadId !== threadId) return;
+    const label = toolLabel(p.item);
+    if (p.item && p.item.type === "commandExecution" && p.item.aggregatedOutput && !streamedOutputItemIds.has(p.item.id)) {
+      ensureStdoutNewline();
+      writeStdout(p.item.aggregatedOutput);
+      ensureStdoutNewline();
+    }
+    if (label) writeStdoutLine(`< ${label} (${toolStatus(p.item)})`);
   });
   client.on("item/commandExecution/outputDelta", (p) => {
-    if (!threadId || p.threadId === threadId) process.stdout.write(outputDelta(p));
+    if (!threadId || p.threadId === threadId) {
+      if (p.itemId) streamedOutputItemIds.add(p.itemId);
+      writeStdout(outputDelta(p));
+    }
   });
   client.on("item/fileChange/outputDelta", (p) => {
-    if (!threadId || p.threadId === threadId) process.stdout.write(outputDelta(p));
+    if (!threadId || p.threadId === threadId) writeStdout(outputDelta(p));
+  });
+  client.on("command/exec/outputDelta", (p) => {
+    writeStdout(outputBase64Delta(p));
+  });
+  client.on("process/outputDelta", (p) => {
+    writeStdout(outputBase64Delta(p));
+  });
+  client.on("item/mcpToolCall/progress", (p) => {
+    if (!threadId || p.threadId === threadId) writeStdoutLine(`> ${p.message}`);
   });
   client.on("error", (p) => {
     if (!threadId || !p.threadId || p.threadId === threadId) {
@@ -509,7 +588,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
   client.on("turn/completed", (p) => {
     if (p.threadId === threadId && (!turnId || !p.turn || p.turn.id === turnId)) {
       completed = true;
-      if (!process.stdout.isTTY) process.stdout.write("\n");
+      ensureStdoutNewline();
       updateRunState("completed", { exitCode });
       cleanup();
       process.exit(exitCode);

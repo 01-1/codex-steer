@@ -54,7 +54,7 @@ Examples:
 
 The first form starts a Codex app-server turn and streams live output to stdout.
 The steer/send forms append user input to the active turn for that id.
-Ids may repeat after a run exits, but not while another run with that id is active.
+Ids cannot be reused. Use send to continue the saved thread for an id.
 `);
   process.exit(exitCode);
 }
@@ -143,15 +143,31 @@ function removeControlSocket(id) {
 function acquireRunLock(id) {
   ensureStateDir();
   const existing = readState(id);
-  if (stateIsActive(existing) && pidIsAlive(existing.ownerPid)) {
-    die(`id "${id}" is already running as pid ${existing.ownerPid}`);
+  if (existing) {
+    if (stateIsActive(existing) && pidIsAlive(existing.ownerPid)) {
+      die(`id "${id}" is already running as pid ${existing.ownerPid}`);
+    }
+    die(`id "${id}" already exists; use "send ${id} <message...>" to continue its thread`);
   }
-  removeState(id);
 
   try {
     const fd = fs.openSync(lockPath(id), "wx", 0o600);
     fs.writeFileSync(fd, String(process.pid));
     removeControlSocket(id);
+    return fd;
+  } catch {
+    die(`id "${id}" is already running`);
+  }
+}
+
+function acquireExistingRunLock(id) {
+  ensureStateDir();
+  removeLock(id);
+  removeControlSocket(id);
+
+  try {
+    const fd = fs.openSync(lockPath(id), "wx", 0o600);
+    fs.writeFileSync(fd, String(process.pid));
     return fd;
   } catch {
     die(`id "${id}" is already running`);
@@ -460,6 +476,35 @@ async function startRun(id, prompt) {
   });
 }
 
+async function sendRun(id, message) {
+  const state = readState(id);
+  if (!state) die(`no state for id "${id}"`);
+  if (state.status === "running" && pidIsAlive(state.ownerPid)) {
+    await sendToActiveRun(id, message);
+    return;
+  }
+  if (state.status === "running") {
+    state.status = "stale";
+    state.ownerPid = null;
+    state.endedAt = new Date().toISOString();
+    writeState(id, state);
+  }
+  if (stateIsActive(state) && pidIsAlive(state.ownerPid)) {
+    die(`id "${id}" is already running as pid ${state.ownerPid}`);
+  }
+  if (!state.threadId) {
+    die(`id "${id}" has no saved threadId to continue`);
+  }
+
+  await startTurn(id, state.kind || "run", async (client, threadId) => {
+    const turn = await client.request("turn/start", {
+      threadId,
+      input: userInput(message),
+    });
+    return { threadId, turnId: turn.turn.id };
+  }, null, { existingState: state, resumeThreadId: state.threadId });
+}
+
 async function startReview(id, target, context) {
   await startTurn(id, "review", async (client, threadId) => {
     const review = await client.request("review/start", {
@@ -482,8 +527,8 @@ async function startReview(id, target, context) {
   });
 }
 
-async function startTurn(id, kind, starter, afterStart = null) {
-  const lockFd = acquireRunLock(id);
+async function startTurn(id, kind, starter, afterStart = null, options = {}) {
+  const lockFd = options.existingState ? acquireExistingRunLock(id) : acquireRunLock(id);
   const client = new JsonRpcClient();
   let threadId = null;
   let turnId = null;
@@ -492,7 +537,18 @@ async function startTurn(id, kind, starter, afterStart = null) {
   let completed = false;
   let exitCode = 0;
   let cleanedUp = false;
-  let state = {
+  let state = options.existingState ? {
+    ...options.existingState,
+    id,
+    kind,
+    status: "starting",
+    ownerPid: process.pid,
+    previousTurnId: options.existingState.turnId || null,
+    controlSocket: controlPath(id),
+    cwd: process.cwd(),
+    startedAt: new Date().toISOString(),
+    endedAt: undefined,
+  } : {
     id,
     kind,
     status: "starting",
@@ -597,10 +653,15 @@ async function startTurn(id, kind, starter, afterStart = null) {
 
   try {
     await initialize(client);
-    const thread = await client.request("thread/start", {
-      cwd: process.cwd(),
-      threadSource: "codex_app_server",
-    });
+    const thread = options.resumeThreadId ?
+      await client.request("thread/resume", {
+        threadId: options.resumeThreadId,
+        cwd: process.cwd(),
+      }) :
+      await client.request("thread/start", {
+        cwd: process.cwd(),
+        threadSource: "codex_app_server",
+      });
     threadId = thread.thread.id;
 
     const started = await starter(client, threadId);
@@ -633,7 +694,7 @@ async function startTurn(id, kind, starter, afterStart = null) {
   }
 }
 
-async function steerRun(id, message) {
+async function sendToActiveRun(id, message) {
   const state = readState(id);
   if (!state || state.status !== "running") die(`no running thread for id "${id}"`);
   if (!pidIsAlive(state.ownerPid)) {
@@ -736,8 +797,12 @@ async function main() {
     stop(safeId(args[1]));
     return;
   }
-  if (args[0] === "steer" || args[0] === "send") {
-    await steerRun(safeId(args[1]), getPrompt(args, 2));
+  if (args[0] === "steer") {
+    await sendToActiveRun(safeId(args[1]), getPrompt(args, 2));
+    return;
+  }
+  if (args[0] === "send") {
+    await sendRun(safeId(args[1]), getPrompt(args, 2));
     return;
   }
 

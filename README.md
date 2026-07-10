@@ -41,17 +41,41 @@ Start a run:
 cxrun fix-tests "fix the failing tests"
 ```
 
-Steer the active turn while it is still running:
+Choose a model for a run:
+
+```sh
+cxrun --model gpt-5.4 fix-tests "fix the failing tests"
+```
+
+The selected model is saved with the id and reused by later `send` continuations.
+
+Send a message using either alias:
 
 ```sh
 cxrun steer fix-tests "only change the parser"
+cxrun send fix-tests "only change the parser"
 ```
 
-Send a new message to the saved thread after the active turn has completed:
+Both commands steer the active turn when one is running, or start a continuation on the saved thread after it completes:
 
 ```sh
 cxrun send fix-tests "now add the regression test"
 ```
+
+Change the model when starting that continuation:
+
+```sh
+cxrun send --model gpt-5.4 fix-tests "now add the regression test"
+```
+
+You can also select a different model with either alias:
+
+```sh
+cxrun steer --model gpt-5.4 fix-tests "use the new model on the next turn"
+cxrun send --model gpt-5.4 fix-tests "use the new model on the next turn"
+```
+
+If a turn is already running, app-server cannot change that turn's model: the message is handled by the current model and the selection applies to subsequent turns. If the previous turn has completed, the continuation starts on the selected model immediately.
 
 Read a multiline prompt or steering message from stdin:
 
@@ -67,7 +91,7 @@ cxrun status
 cxrun stop fix-tests
 ```
 
-Ids cannot be reused. Use `cxrun send <id> <message...>` to continue a saved thread instead of starting a new run with the same id.
+Ids cannot be reused. Use `cxrun steer <id> <message...>` or `cxrun send <id> <message...>` to continue a saved thread instead of starting a new run with the same id.
 Completed, interrupted, stopped, failed, and stale runs leave a small state file with the last known `threadId` and `turnId`, so `cxrun send <id> <message...>` can continue the thread after the process is gone.
 
 ## Reviews
@@ -76,6 +100,12 @@ Start a review of uncommitted changes:
 
 ```sh
 cxreview my-review
+```
+
+Choose a model for a review:
+
+```sh
+cxreview --model gpt-5.4 my-review
 ```
 
 Review against a base branch:
@@ -124,6 +154,7 @@ npm publish
 ## Notes
 
 - Requires `codex` on `PATH`.
+- `--model <model>` overrides the configured Codex model for a new run or review. It is also accepted after the `steer` or `send` command. The model is stored in that id's state and reused by later continuation turns.
 - Uses `codex app-server --stdio` for runs and reviews. While a run is active, `cxrun steer`/`cxrun send` talk to that wrapper process through a local socket in the state directory. After a run exits, `cxrun send` resumes the saved thread and starts a new turn.
 - `cxrun daemon-start` runs `codex app-server daemon start` and enables app-server remote control for users who want the Codex-managed daemon separately.
 - Requires Node.js 18 or newer.

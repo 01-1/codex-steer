@@ -19,10 +19,10 @@ function usage(exitCode = 0) {
   const out = exitCode === 0 ? process.stdout : process.stderr;
   if (IS_REVIEW) {
     out.write(`Usage:
-  cxreview <id> [context...]
-  cxreview review <id> [--against <branch>] [context...]
-  cxreview steer <id> <message...>
-  cxreview send <id> <message...>
+  cxreview [--model <model>] <id> [context...]
+  cxreview review [--model <model>] <id> [--against <branch>] [context...]
+  cxreview steer [--model <model>] <id> <message...>
+  cxreview send [--model <model>] <id> <message...>
   cxreview status [id]
   cxreview stop <id>
 
@@ -32,7 +32,8 @@ Examples:
   cxreview steer my-review "ignore generated files"
 
 The first form starts a Codex app-server review and streams live output to stdout.
-The steer/send forms append user input to the active review turn for that id.
+The steer/send forms are aliases: they append input to an active review turn or
+continue the saved thread when no turn is active.
 If app-server reports that the active review turn is not steerable, cxreview prints
 the exact JSON-RPC error.
 `);
@@ -40,10 +41,10 @@ the exact JSON-RPC error.
   }
 
   out.write(`Usage:
-  cxrun <id> <prompt...>
-  cxrun <id> -- <prompt...>
-  cxrun steer <id> <message...>
-  cxrun send <id> <message...>
+  cxrun [--model <model>] <id> <prompt...>
+  cxrun [--model <model>] <id> -- <prompt...>
+  cxrun steer [--model <model>] <id> <message...>
+  cxrun send [--model <model>] <id> <message...>
   cxrun status [id]
   cxrun stop <id>
 
@@ -53,8 +54,8 @@ Examples:
   printf 'now add tests\\nkeep them focused\\n' | cxrun send fix-tests -
 
 The first form starts a Codex app-server turn and streams live output to stdout.
-The steer/send forms append user input to the active turn for that id.
-Ids cannot be reused. Use send to continue the saved thread for an id.
+The steer/send forms are aliases: they append input to an active turn or continue
+the saved thread when no turn is active. Ids cannot be reused.
 `);
   process.exit(exitCode);
 }
@@ -191,6 +192,24 @@ function getPrompt(args, offset) {
   return parts.join(" ");
 }
 
+function parseModelOption(args, offset = 0) {
+  let model = null;
+  let nextOffset = offset;
+  const arg = args[nextOffset];
+
+  if (arg === "--model") {
+    model = args[nextOffset + 1];
+    if (!model || model.startsWith("-")) die("--model requires a model");
+    nextOffset += 2;
+  } else if (arg && arg.startsWith("--model=")) {
+    model = arg.slice("--model=".length);
+    if (!model) die("--model requires a model");
+    nextOffset += 1;
+  }
+
+  return { model, nextOffset };
+}
+
 function codex(args, options = {}) {
   const result = spawnSync("codex", args, {
     stdio: options.stdio || "inherit",
@@ -208,15 +227,18 @@ function ensureAppServerDaemon() {
 }
 
 class JsonRpcClient {
-  constructor() {
+  constructor(model = null) {
     this.nextId = 1;
     this.pending = new Map();
     this.handlers = new Map();
-    this.spawnServer();
+    this.spawnServer(model);
   }
 
-  spawnServer() {
-    this.proc = spawn("codex", ["app-server", "--stdio"], {
+  spawnServer(model) {
+    const args = ["app-server"];
+    if (model) args.push("--config", `model=${JSON.stringify(model)}`);
+    args.push("--stdio");
+    this.proc = spawn("codex", args, {
       stdio: ["pipe", "pipe", "pipe"],
       env: process.env,
     });
@@ -466,21 +488,21 @@ function startControlServer(id, handleMessage) {
   });
 }
 
-async function startRun(id, prompt) {
+async function startRun(id, prompt, model) {
   await startTurn(id, "run", async (client, threadId) => {
     const turn = await client.request("turn/start", {
       threadId,
       input: userInput(prompt),
     });
     return { threadId, turnId: turn.turn.id };
-  });
+  }, null, { model });
 }
 
-async function sendRun(id, message) {
+async function sendRun(id, message, model = null) {
   const state = readState(id);
   if (!state) die(`no state for id "${id}"`);
   if (state.status === "running" && pidIsAlive(state.ownerPid)) {
-    await sendToActiveRun(id, message);
+    await sendToActiveRun(id, message, model);
     return;
   }
   if (state.status === "running") {
@@ -496,16 +518,18 @@ async function sendRun(id, message) {
     die(`id "${id}" has no saved threadId to continue`);
   }
 
+  const effectiveModel = model || state.model || null;
   await startTurn(id, state.kind || "run", async (client, threadId) => {
     const turn = await client.request("turn/start", {
       threadId,
       input: userInput(message),
+      ...(effectiveModel ? { model: effectiveModel } : {}),
     });
     return { threadId, turnId: turn.turn.id };
-  }, null, { existingState: state, resumeThreadId: state.threadId });
+  }, null, { existingState: state, resumeThreadId: state.threadId, model: effectiveModel });
 }
 
-async function startReview(id, target, context) {
+async function startReview(id, target, context, model) {
   await startTurn(id, "review", async (client, threadId) => {
     const review = await client.request("review/start", {
       threadId,
@@ -524,12 +548,12 @@ async function startReview(id, target, context) {
     } catch (err) {
       process.stderr.write(`${APP_NAME}: ${err.message || String(err)}\n`);
     }
-  });
+  }, { model });
 }
 
 async function startTurn(id, kind, starter, afterStart = null, options = {}) {
   const lockFd = options.existingState ? acquireExistingRunLock(id) : acquireRunLock(id);
-  const client = new JsonRpcClient();
+  const client = new JsonRpcClient(options.model || null);
   let threadId = null;
   let turnId = null;
   let controlServer = null;
@@ -546,6 +570,7 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
     previousTurnId: options.existingState.turnId || null,
     controlSocket: controlPath(id),
     cwd: process.cwd(),
+    model: options.model || null,
     startedAt: new Date().toISOString(),
     endedAt: undefined,
   } : {
@@ -557,6 +582,7 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
     turnId: null,
     controlSocket: controlPath(id),
     cwd: process.cwd(),
+    model: options.model || null,
     startedAt: new Date().toISOString(),
   };
 
@@ -671,6 +697,13 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
       if (!request || (request.method !== "turn/steer" && request.method !== "turn/send")) {
         throw new Error("unsupported local control request");
       }
+      if (request.model) {
+        await client.request("thread/settings/update", {
+          threadId,
+          model: request.model,
+        });
+        updateRunState("running", { model: request.model });
+      }
       await client.request("turn/steer", {
         threadId,
         expectedTurnId: turnId,
@@ -694,7 +727,7 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
   }
 }
 
-async function sendToActiveRun(id, message) {
+async function sendToActiveRun(id, message, model = null) {
   const state = readState(id);
   if (!state || state.status !== "running") die(`no running thread for id "${id}"`);
   if (!pidIsAlive(state.ownerPid)) {
@@ -716,7 +749,7 @@ async function sendToActiveRun(id, message) {
     }, RPC_TIMEOUT_MS);
     socket.once("connect", async () => {
       clearTimeout(timer);
-      socket.write(`${JSON.stringify({ method: "turn/steer", message })}\n`);
+      socket.write(`${JSON.stringify({ method: "turn/steer", message, model })}\n`);
       try {
         const response = await readJsonLine(socket);
         socket.end();
@@ -798,23 +831,35 @@ async function main() {
     return;
   }
   if (args[0] === "steer") {
-    await sendToActiveRun(safeId(args[1]), getPrompt(args, 2));
+    const parsed = parseModelOption(args, 1);
+    await sendRun(
+      safeId(args[parsed.nextOffset]),
+      getPrompt(args, parsed.nextOffset + 1),
+      parsed.model,
+    );
     return;
   }
   if (args[0] === "send") {
-    await sendRun(safeId(args[1]), getPrompt(args, 2));
+    const parsed = parseModelOption(args, 1);
+    await sendRun(
+      safeId(args[parsed.nextOffset]),
+      getPrompt(args, parsed.nextOffset + 1),
+      parsed.model,
+    );
     return;
   }
 
   if (IS_REVIEW) {
-    const offset = args[0] === "review" ? 2 : 1;
-    const id = safeId(args[offset - 1]);
-    const review = parseReviewArgs(args, offset);
-    await startReview(id, review.target, review.context);
+    const optionOffset = args[0] === "review" ? 1 : 0;
+    const parsed = parseModelOption(args, optionOffset);
+    const id = safeId(args[parsed.nextOffset]);
+    const review = parseReviewArgs(args, parsed.nextOffset + 1);
+    await startReview(id, review.target, review.context, parsed.model);
     return;
   }
 
-  await startRun(safeId(args[0]), getPrompt(args, 1));
+  const parsed = parseModelOption(args);
+  await startRun(safeId(args[parsed.nextOffset]), getPrompt(args, parsed.nextOffset + 1), parsed.model);
 }
 
 main().catch((err) => die(err.message || String(err)));

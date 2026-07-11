@@ -47,7 +47,13 @@ Choose a model for a run:
 cxrun --model gpt-5.4 fix-tests "fix the failing tests"
 ```
 
-The selected model is saved with the id and reused by later `send` continuations.
+Choose the reasoning effort, with or without a model override:
+
+```sh
+cxrun --model gpt-5.4 --effort high fix-tests "fix the failing tests"
+```
+
+The selected model and effort are saved with the id and reused by later continuations.
 
 Send a message using either alias:
 
@@ -66,6 +72,7 @@ Change the model when starting that continuation:
 
 ```sh
 cxrun send --model gpt-5.4 fix-tests "now add the regression test"
+cxrun send --effort high fix-tests "now add the regression test"
 ```
 
 You can also select a different model with either alias:
@@ -73,9 +80,10 @@ You can also select a different model with either alias:
 ```sh
 cxrun steer --model gpt-5.4 fix-tests "use the new model on the next turn"
 cxrun send --model gpt-5.4 fix-tests "use the new model on the next turn"
+cxrun steer --effort high fix-tests "use high effort on the next turn"
 ```
 
-If a turn is already running, app-server cannot change that turn's model: the message is handled by the current model and the selection applies to subsequent turns. If the previous turn has completed, the continuation starts on the selected model immediately.
+If a turn is already running, app-server cannot change that turn's model or effort: the message is handled with the current settings and the selection applies to subsequent turns. If the previous turn has completed, the continuation starts with the selected settings immediately.
 
 Read a multiline prompt or steering message from stdin:
 
@@ -105,7 +113,7 @@ cxreview my-review
 Choose a model for a review:
 
 ```sh
-cxreview --model gpt-5.4 my-review
+cxreview --model gpt-5.4 --effort high my-review
 ```
 
 Review against a base branch:
@@ -154,7 +162,7 @@ npm publish
 ## Notes
 
 - Requires `codex` on `PATH`.
-- `--model <model>` overrides the configured Codex model for a new run or review. It is also accepted after the `steer` or `send` command. The model is stored in that id's state and reused by later continuation turns.
+- `--model <model>` and `--effort <level>` override the configured Codex settings for a new run or review. They are also accepted after the `steer` or `send` command. Both settings are stored in that id's state and reused by later continuation turns.
 - Uses `codex app-server --stdio` for runs and reviews. While a run is active, `cxrun steer`/`cxrun send` talk to that wrapper process through a local socket in the state directory. After a run exits, `cxrun send` resumes the saved thread and starts a new turn.
 - `cxrun daemon-start` runs `codex app-server daemon start` and enables app-server remote control for users who want the Codex-managed daemon separately.
 - Requires Node.js 18 or newer.

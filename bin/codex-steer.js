@@ -19,10 +19,10 @@ function usage(exitCode = 0) {
   const out = exitCode === 0 ? process.stdout : process.stderr;
   if (IS_REVIEW) {
     out.write(`Usage:
-  cxreview [--model <model>] <id> [context...]
-  cxreview review [--model <model>] <id> [--against <branch>] [context...]
-  cxreview steer [--model <model>] <id> <message...>
-  cxreview send [--model <model>] <id> <message...>
+  cxreview [--model <model>] [--effort <level>] <id> [context...]
+  cxreview review [--model <model>] [--effort <level>] <id> [--against <branch>] [context...]
+  cxreview steer [--model <model>] [--effort <level>] <id> <message...>
+  cxreview send [--model <model>] [--effort <level>] <id> <message...>
   cxreview status [id]
   cxreview stop <id>
 
@@ -41,10 +41,10 @@ the exact JSON-RPC error.
   }
 
   out.write(`Usage:
-  cxrun [--model <model>] <id> <prompt...>
-  cxrun [--model <model>] <id> -- <prompt...>
-  cxrun steer [--model <model>] <id> <message...>
-  cxrun send [--model <model>] <id> <message...>
+  cxrun [--model <model>] [--effort <level>] <id> <prompt...>
+  cxrun [--model <model>] [--effort <level>] <id> -- <prompt...>
+  cxrun steer [--model <model>] [--effort <level>] <id> <message...>
+  cxrun send [--model <model>] [--effort <level>] <id> <message...>
   cxrun status [id]
   cxrun stop <id>
 
@@ -192,22 +192,34 @@ function getPrompt(args, offset) {
   return parts.join(" ");
 }
 
-function parseModelOption(args, offset = 0) {
+function parseRunOptions(args, offset = 0) {
   let model = null;
+  let effort = null;
   let nextOffset = offset;
-  const arg = args[nextOffset];
 
-  if (arg === "--model") {
-    model = args[nextOffset + 1];
-    if (!model || model.startsWith("-")) die("--model requires a model");
-    nextOffset += 2;
-  } else if (arg && arg.startsWith("--model=")) {
-    model = arg.slice("--model=".length);
-    if (!model) die("--model requires a model");
-    nextOffset += 1;
+  for (;;) {
+    const arg = args[nextOffset];
+    if (arg === "--model" || arg === "--effort") {
+      const value = args[nextOffset + 1];
+      if (!value || value.startsWith("-")) die(`${arg} requires a value`);
+      if (arg === "--model") model = value;
+      else effort = value;
+      nextOffset += 2;
+      continue;
+    }
+    if (arg && (arg.startsWith("--model=") || arg.startsWith("--effort="))) {
+      const [option, ...valueParts] = arg.split("=");
+      const value = valueParts.join("=");
+      if (!value) die(`${option} requires a value`);
+      if (option === "--model") model = value;
+      else effort = value;
+      nextOffset += 1;
+      continue;
+    }
+    break;
   }
 
-  return { model, nextOffset };
+  return { model, effort, nextOffset };
 }
 
 function codex(args, options = {}) {
@@ -227,16 +239,17 @@ function ensureAppServerDaemon() {
 }
 
 class JsonRpcClient {
-  constructor(model = null) {
+  constructor(model = null, effort = null) {
     this.nextId = 1;
     this.pending = new Map();
     this.handlers = new Map();
-    this.spawnServer(model);
+    this.spawnServer(model, effort);
   }
 
-  spawnServer(model) {
+  spawnServer(model, effort) {
     const args = ["app-server"];
     if (model) args.push("--config", `model=${JSON.stringify(model)}`);
+    if (effort) args.push("--config", `model_reasoning_effort=${JSON.stringify(effort)}`);
     args.push("--stdio");
     this.proc = spawn("codex", args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -488,21 +501,21 @@ function startControlServer(id, handleMessage) {
   });
 }
 
-async function startRun(id, prompt, model) {
+async function startRun(id, prompt, model, effort) {
   await startTurn(id, "run", async (client, threadId) => {
     const turn = await client.request("turn/start", {
       threadId,
       input: userInput(prompt),
     });
     return { threadId, turnId: turn.turn.id };
-  }, null, { model });
+  }, null, { model, effort });
 }
 
-async function sendRun(id, message, model = null) {
+async function sendRun(id, message, model = null, effort = null) {
   const state = readState(id);
   if (!state) die(`no state for id "${id}"`);
   if (state.status === "running" && pidIsAlive(state.ownerPid)) {
-    await sendToActiveRun(id, message, model);
+    await sendToActiveRun(id, message, model, effort);
     return;
   }
   if (state.status === "running") {
@@ -519,17 +532,24 @@ async function sendRun(id, message, model = null) {
   }
 
   const effectiveModel = model || state.model || null;
+  const effectiveEffort = effort || state.effort || null;
   await startTurn(id, state.kind || "run", async (client, threadId) => {
     const turn = await client.request("turn/start", {
       threadId,
       input: userInput(message),
       ...(effectiveModel ? { model: effectiveModel } : {}),
+      ...(effectiveEffort ? { effort: effectiveEffort } : {}),
     });
     return { threadId, turnId: turn.turn.id };
-  }, null, { existingState: state, resumeThreadId: state.threadId, model: effectiveModel });
+  }, null, {
+    existingState: state,
+    resumeThreadId: state.threadId,
+    model: effectiveModel,
+    effort: effectiveEffort,
+  });
 }
 
-async function startReview(id, target, context, model) {
+async function startReview(id, target, context, model, effort) {
   await startTurn(id, "review", async (client, threadId) => {
     const review = await client.request("review/start", {
       threadId,
@@ -548,12 +568,12 @@ async function startReview(id, target, context, model) {
     } catch (err) {
       process.stderr.write(`${APP_NAME}: ${err.message || String(err)}\n`);
     }
-  }, { model });
+  }, { model, effort });
 }
 
 async function startTurn(id, kind, starter, afterStart = null, options = {}) {
   const lockFd = options.existingState ? acquireExistingRunLock(id) : acquireRunLock(id);
-  const client = new JsonRpcClient(options.model || null);
+  const client = new JsonRpcClient(options.model || null, options.effort || null);
   let threadId = null;
   let turnId = null;
   let controlServer = null;
@@ -571,6 +591,7 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
     controlSocket: controlPath(id),
     cwd: process.cwd(),
     model: options.model || null,
+    effort: options.effort || null,
     startedAt: new Date().toISOString(),
     endedAt: undefined,
   } : {
@@ -583,6 +604,7 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
     controlSocket: controlPath(id),
     cwd: process.cwd(),
     model: options.model || null,
+    effort: options.effort || null,
     startedAt: new Date().toISOString(),
   };
 
@@ -697,12 +719,16 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
       if (!request || (request.method !== "turn/steer" && request.method !== "turn/send")) {
         throw new Error("unsupported local control request");
       }
-      if (request.model) {
+      if (request.model || request.effort) {
         await client.request("thread/settings/update", {
           threadId,
-          model: request.model,
+          ...(request.model ? { model: request.model } : {}),
+          ...(request.effort ? { effort: request.effort } : {}),
         });
-        updateRunState("running", { model: request.model });
+        updateRunState("running", {
+          ...(request.model ? { model: request.model } : {}),
+          ...(request.effort ? { effort: request.effort } : {}),
+        });
       }
       await client.request("turn/steer", {
         threadId,
@@ -727,7 +753,7 @@ async function startTurn(id, kind, starter, afterStart = null, options = {}) {
   }
 }
 
-async function sendToActiveRun(id, message, model = null) {
+async function sendToActiveRun(id, message, model = null, effort = null) {
   const state = readState(id);
   if (!state || state.status !== "running") die(`no running thread for id "${id}"`);
   if (!pidIsAlive(state.ownerPid)) {
@@ -749,7 +775,7 @@ async function sendToActiveRun(id, message, model = null) {
     }, RPC_TIMEOUT_MS);
     socket.once("connect", async () => {
       clearTimeout(timer);
-      socket.write(`${JSON.stringify({ method: "turn/steer", message, model })}\n`);
+      socket.write(`${JSON.stringify({ method: "turn/steer", message, model, effort })}\n`);
       try {
         const response = await readJsonLine(socket);
         socket.end();
@@ -831,35 +857,42 @@ async function main() {
     return;
   }
   if (args[0] === "steer") {
-    const parsed = parseModelOption(args, 1);
+    const parsed = parseRunOptions(args, 1);
     await sendRun(
       safeId(args[parsed.nextOffset]),
       getPrompt(args, parsed.nextOffset + 1),
       parsed.model,
+      parsed.effort,
     );
     return;
   }
   if (args[0] === "send") {
-    const parsed = parseModelOption(args, 1);
+    const parsed = parseRunOptions(args, 1);
     await sendRun(
       safeId(args[parsed.nextOffset]),
       getPrompt(args, parsed.nextOffset + 1),
       parsed.model,
+      parsed.effort,
     );
     return;
   }
 
   if (IS_REVIEW) {
     const optionOffset = args[0] === "review" ? 1 : 0;
-    const parsed = parseModelOption(args, optionOffset);
+    const parsed = parseRunOptions(args, optionOffset);
     const id = safeId(args[parsed.nextOffset]);
     const review = parseReviewArgs(args, parsed.nextOffset + 1);
-    await startReview(id, review.target, review.context, parsed.model);
+    await startReview(id, review.target, review.context, parsed.model, parsed.effort);
     return;
   }
 
-  const parsed = parseModelOption(args);
-  await startRun(safeId(args[parsed.nextOffset]), getPrompt(args, parsed.nextOffset + 1), parsed.model);
+  const parsed = parseRunOptions(args);
+  await startRun(
+    safeId(args[parsed.nextOffset]),
+    getPrompt(args, parsed.nextOffset + 1),
+    parsed.model,
+    parsed.effort,
+  );
 }
 
 main().catch((err) => die(err.message || String(err)));
